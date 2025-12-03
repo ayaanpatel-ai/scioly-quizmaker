@@ -1,12 +1,15 @@
-from fastapi import FastAPI, UploadFile, File
+# app.py
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from PyPDF2 import PdfReader
 from groq import Groq
 import os
+import json
+import traceback
 
 app = FastAPI(title="QuizMaker Backend")
 
+# --- CORS for Wix ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,103 +21,106 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 @app.get("/")
 async def root():
-    return {"status": "running"}
+    return {"status": "ok", "msg": "QuizMaker backend running"}
 
-def extract_pdf_text(pdf_file):
-    """
-    Extracts text safely — ignores encrypted pages so PyCryptodome is NOT required.
-    """
-    reader = PdfReader(pdf_file)
-    text = ""
-
-    for page in reader.pages:
-        try:
-            text += page.extract_text() or ""
-        except:
-            continue  # ignore encrypted/problematic pages
-
-    return text
-
+# --------------- QUIZ GENERATION ------------------
 
 @app.post("/generate_quiz")
 async def generate_quiz(pdf: UploadFile = File(...)):
     try:
-        text = extract_pdf_text(pdf.file)
+        # Read PDF safely
+        try:
+            reader = PdfReader(pdf.file)
+            text = ""
+            for page in reader.pages:
+                txt = page.extract_text() or ""
+                text += txt
+        except Exception:
+            return {"error": "Failed to open PDF. (Encrypted PDFs require PyCryptodome)"}
 
         if not text.strip():
-            return JSONResponse({"error": "PDF text extraction failed"}, 400)
+            return {"error": "PDF contained no readable text."}
 
         prompt = f"""
-        Create a quiz based on this content:
+You are generating a quiz. 
+Return ONLY valid JSON. No explanations. No code fences.
 
-        {text}
+Create 20–30 mixed questions from the following content:
 
-        Format the quiz STRICTLY as JSON:
+{text}
 
-        {{
-          "questions": [
-            {{
-              "id": 1,
-              "type": "mc",
-              "question": "...",
-              "options": ["A", "B", "C", "D"],
-              "answer": "B"
-            }},
-            {{
-              "id": 2,
-              "type": "short",
-              "question": "...",
-              "answer": "the mitochondria is the powerhouse of the cell"
-            }}
-          ]
-        }}
+Each question must be formatted exactly like this:
 
-        Do NOT include explanations. Do NOT add extra text.
-        Only output valid JSON.
-        """
+{{
+  "id": 1,
+  "type": "short" | "mc" | "tf" | "yn",
+  "question": "text",
+  "options": ["a) ...", "b) ..."] OR null,
+  "answer": "correct answer"
+}}
 
-        res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+Return a JSON object:
+{{"questions": [ ... ]}}
+"""
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",  
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0.3,
         )
 
-        quiz_json = res.choices[0].message.content
+        content = response.choices[0].message.content
 
-        return JSONResponse({"quiz": quiz_json})
+        # Remove accidental code fences
+        content = content.replace("```json", "").replace("```", "")
+
+        quiz_json = json.loads(content)
+
+        return quiz_json
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return {"error": str(e), "trace": traceback.format_exc()}
 
+# ------------------- GRADING ENDPOINT -------------------
 
-@app.post("/grade_quiz")
-async def grade_quiz(payload: dict):
+@app.post("/grade")
+async def grade(questions_json: str = Form(...), answers_json: str = Form(...)):
+    """
+    questions_json = JSON returned by /generate_quiz
+    answers_json = {"1": "user answer", "2": "B", ...}
+    """
+
     try:
-        quiz = payload["quiz"]          # the quiz JSON as dict
-        user_answers = payload["answers"]  # { "1": "B", "2": "blah" }
+        questions = json.loads(questions_json)
+        answers = json.loads(answers_json)
 
-        results = {}
-        correct_count = 0
+        prompt = f"""
+Grade the following quiz.
 
-        for q in quiz["questions"]:
-            qid = str(q["id"])
-            correct_answer = q["answer"]
-            user_answer = user_answers.get(qid, "")
+QUESTIONS:
+{json.dumps(questions)}
 
-            if q["type"] == "mc":
-                is_correct = user_answer.strip().upper() == correct_answer.strip().upper()
-            else:  # short answer
-                is_correct = correct_answer.lower() in user_answer.lower()
+USER ANSWERS:
+{json.dumps(answers)}
 
-            results[qid] = is_correct
-            if is_correct:
-                correct_count += 1
+Return ONLY JSON:
+{{
+  "scores": {{"1": true/false, ...}},
+  "total_correct": X,
+  "total_questions": Y
+}}
+"""
 
-        return JSONResponse({
-            "scores": results,
-            "total_correct": correct_count,
-            "total_questions": len(quiz["questions"])
-        })
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+
+        graded = response.choices[0].message.content
+        graded = graded.replace("```json", "").replace("```", "")
+
+        return json.loads(graded)
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return {"error": str(e), "trace": traceback.format_exc()}
