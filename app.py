@@ -4,101 +4,119 @@ from fastapi.middleware.cors import CORSMiddleware
 from PyPDF2 import PdfReader
 from groq import Groq
 import os
-import traceback
 
 app = FastAPI(title="Quiz Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock to your Wix domain later if you want
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+
 @app.get("/")
-async def root():
-    return {"status": "ok", "message": "Quiz backend is running."}
+def root():
+    return {"status": "ok"}
 
-@app.post("/upload")
-async def upload(pdf: UploadFile = File(...)):
-    """
-    Accepts multipart/form-data with field name 'pdf'.
-    Returns JSON: { "quiz": "<generated text>" } or { "error": "..." }
-    """
+
+# ----------- QUIZ GENERATION -----------
+@app.post("/generate_quiz")
+async def generate_quiz(pdf: UploadFile = File(...)):
     try:
-        # Validate file type quickly
-        if not pdf.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Uploaded file is not a PDF (filename check).")
+        # Read PDF
+        reader = PdfReader(pdf.file)
 
-        # Read PDF file contents using PyPDF2
-        try:
-            reader = PdfReader(pdf.file)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to open PDF: {e}")
+        # Detect encryption (this is your PyCryptodome error)
+        if reader.is_encrypted:
+            raise HTTPException(
+                status_code=400,
+                detail="PDF is encrypted. Please upload a non-password-protected PDF."
+            )
 
-        text_chunks = []
+        text = ""
         for page in reader.pages:
-            ptxt = page.extract_text()
-            if ptxt:
-                text_chunks.append(ptxt)
-        full_text = "\n".join(text_chunks).strip()
+            text += page.extract_text() or ""
 
-        if not full_text:
-            raise HTTPException(status_code=400, detail="Could not extract any text from the PDF.")
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF.")
 
-        # Build prompt
-        prompt = f"""Generate a clear, well-formatted quiz based strictly on the text below.
-Include a mix of multiple-choice, short answer, and true/false questions. Return plain text only.
+        # Prompt with answer key
+        prompt = f"""
+You are a science quiz generator.
 
-Text:
-{full_text}
+Create:
+1. 10 multiple-choice questions
+2. 5 short-answer questions
+3. Provide an answer key at the end
+
+Base everything STRICTLY on this PDF content:
+
+{text}
 """
 
-        # Call Groq — use a currently supported model
-        # If you get a deprecation error, swap model to another supported one (e.g. "mixtral-8x7b-32768")
-        response = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2
         )
 
-        # Robust extraction of generated content:
-        # Groq's response.choices[0].message may be an object with .content or a dict-like mapping.
-        try:
-            first_choice = response.choices[0]
-        except Exception:
-            raise HTTPException(status_code=500, detail="Model returned unexpected response shape (no choices).")
+        quiz = res.choices[0].message.content
 
-        message = getattr(first_choice, "message", None) or first_choice.get("message", None)
+        return {"quiz": quiz}
 
-        # message may be an object with attribute 'content' OR a mapping with key 'content'
-        quiz_text = None
-        if message is None:
-            # Try other fallbacks
-            # Some SDKs return: first_choice["message"]["content"] or first_choice["text"]
-            try:
-                quiz_text = first_choice["message"]["content"]
-            except Exception:
-                quiz_text = first_choice.get("text") if isinstance(first_choice, dict) else None
-        else:
-            # attribute-style
-            quiz_text = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
-
-        if not quiz_text:
-            # Last-ditch: try stringifying the whole response
-            quiz_text = str(response)
-
-        return {"quiz": quiz_text}
-
-    except HTTPException as he:
-        # FastAPI will convert to proper JSON + status code
-        raise he
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        tb = traceback.format_exc()
-        # Log tb to Render logs; return sanitized error to client
-        print(tb)
-        # Return 500 with error details for easier debugging (remove stack in production)
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+        return {"error": str(e)}
 
+
+# ----------- ANSWER CHECKING -----------
+@app.post("/check_answers")
+async def check_answers(user_answers: dict):
+    """
+    Expected:
+    {
+      "quiz": "...",
+      "answers": {
+         "1": "B",
+         "2": "C",
+         ...
+      }
+    }
+    """
+    try:
+        prompt = f"""
+Grade the following answers.
+
+QUIZ + ANSWER KEY:
+{user_answers.get('quiz')}
+
+USER ANSWERS:
+{user_answers.get('answers')}
+
+Return JSON in this format ONLY:
+{{
+  "scores": {{
+     "1": true/false,
+     "2": true/false,
+     ...
+  }},
+  "total_correct": X,
+  "total_questions": Y
+}}
+"""
+
+        res = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        graded = res.choices[0].message.content
+        return {"graded": graded}
+
+    except Exception as e:
+        return {"error": str(e)}
