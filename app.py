@@ -1,5 +1,5 @@
 # app.py
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PyPDF2 import PdfReader
 from groq import Groq
@@ -8,53 +8,97 @@ import traceback
 
 app = FastAPI(title="Quiz Backend")
 
-# Allow all origins (you can lock this down later to your Wix domain)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # lock to your Wix domain later if you want
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Groq client (make sure GROQ_API_KEY is set in Render env)
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# --- Health / root route so / doesn't 404 ---
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Quiz backend is running."}
 
-# --- Upload endpoint (POST /upload) ---
-@app.route("/upload", methods=["POST"])
-def upload():
+@app.post("/upload")
+async def upload(pdf: UploadFile = File(...)):
+    """
+    Accepts multipart/form-data with field name 'pdf'.
+    Returns JSON: { "quiz": "<generated text>" } or { "error": "..." }
+    """
     try:
-        if "pdf" not in request.files:
-            return jsonify({"error": "No PDF uploaded"}), 400
+        # Validate file type quickly
+        if not pdf.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Uploaded file is not a PDF (filename check).")
 
-        pdf_file = request.files["pdf"]
+        # Read PDF file contents using PyPDF2
+        try:
+            reader = PdfReader(pdf.file)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to open PDF: {e}")
 
-        # Extract PDF text
-        reader = PdfReader(pdf_file)
-        text = ""
+        text_chunks = []
         for page in reader.pages:
-            text += page.extract_text() or ""
+            ptxt = page.extract_text()
+            if ptxt:
+                text_chunks.append(ptxt)
+        full_text = "\n".join(text_chunks).strip()
 
-        if not text.strip():
-            return jsonify({"error": "PDF text could not be extracted"}), 400
+        if not full_text:
+            raise HTTPException(status_code=400, detail="Could not extract any text from the PDF.")
 
-        prompt = f"Generate a detailed quiz based strictly on the following PDF content:\n\n{text}"
+        # Build prompt
+        prompt = f"""Generate a clear, well-formatted quiz based strictly on the text below.
+Include a mix of multiple-choice, short answer, and true/false questions. Return plain text only.
 
-        # Call Groq
+Text:
+{full_text}
+"""
+
+        # Call Groq — use a currently supported model
+        # If you get a deprecation error, swap model to another supported one (e.g. "mixtral-8x7b-32768")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
 
-        # ✅ Correct way to read Groq output
-        quiz_text = response.choices[0].message.content
+        # Robust extraction of generated content:
+        # Groq's response.choices[0].message may be an object with .content or a dict-like mapping.
+        try:
+            first_choice = response.choices[0]
+        except Exception:
+            raise HTTPException(status_code=500, detail="Model returned unexpected response shape (no choices).")
 
-        return jsonify({"quiz": quiz_text})
+        message = getattr(first_choice, "message", None) or first_choice.get("message", None)
 
+        # message may be an object with attribute 'content' OR a mapping with key 'content'
+        quiz_text = None
+        if message is None:
+            # Try other fallbacks
+            # Some SDKs return: first_choice["message"]["content"] or first_choice["text"]
+            try:
+                quiz_text = first_choice["message"]["content"]
+            except Exception:
+                quiz_text = first_choice.get("text") if isinstance(first_choice, dict) else None
+        else:
+            # attribute-style
+            quiz_text = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else None)
+
+        if not quiz_text:
+            # Last-ditch: try stringifying the whole response
+            quiz_text = str(response)
+
+        return {"quiz": quiz_text}
+
+    except HTTPException as he:
+        # FastAPI will convert to proper JSON + status code
+        raise he
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        tb = traceback.format_exc()
+        # Log tb to Render logs; return sanitized error to client
+        print(tb)
+        # Return 500 with error details for easier debugging (remove stack in production)
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
