@@ -50,10 +50,11 @@ Text:
 
         # Call Groq (adjust model name if you prefer)
         response = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+        model="llama-3.1-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
         )
+
 
         # Extract the generated quiz text
         quiz_text = response.choices[0].message["content"]
