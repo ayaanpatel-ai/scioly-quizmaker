@@ -57,7 +57,7 @@ Text:
 
 
         # Extract the generated quiz text
-        quiz_text = response.choices[0].message["content"]
+        quiz = response.choices[0].message.content
 
         # Return the quiz under the "quiz" field (frontend expects this)
         return {"quiz": quiz_text}
