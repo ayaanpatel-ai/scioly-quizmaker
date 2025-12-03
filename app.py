@@ -25,44 +25,36 @@ async def root():
     return {"status": "ok", "message": "Quiz backend is running."}
 
 # --- Upload endpoint (POST /upload) ---
-@app.post("/upload")
-async def upload(pdf: UploadFile = File(...)):
+@app.route("/upload", methods=["POST"])
+def upload():
     try:
-        # Read and extract text from PDF
-        reader = PdfReader(pdf.file)
+        if "pdf" not in request.files:
+            return jsonify({"error": "No PDF uploaded"}), 400
+
+        pdf_file = request.files["pdf"]
+
+        # Extract PDF text
+        reader = PdfReader(pdf_file)
         text = ""
         for page in reader.pages:
-            ptext = page.extract_text()
-            if ptext:
-                text += ptext + "\n"
+            text += page.extract_text() or ""
 
         if not text.strip():
-            return {"error": "Could not extract any text from the PDF."}
+            return jsonify({"error": "PDF text could not be extracted"}), 400
 
-        # Build prompt for the model
-        prompt = f"""
-Create 10 clear quiz questions (mix of multiple choice, short answer, true/false)
-based on the text below. Return plain text only (no meta JSON).
+        prompt = f"Generate a detailed quiz based strictly on the following PDF content:\n\n{text}"
 
-Text:
-{text}
-"""
-
-        # Call Groq (adjust model name if you prefer)
+        # Call Groq
         response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
         )
 
+        # ✅ Correct way to read Groq output
+        quiz_text = response.choices[0].message.content
 
-        # Extract the generated quiz text
-        quiz = response.choices[0].message.content
-
-        # Return the quiz under the "quiz" field (frontend expects this)
-        return {"quiz": quiz_text}
+        return jsonify({"quiz": quiz_text})
 
     except Exception as e:
-        # Return error message so frontend can show it instead of "undefined"
-        tb = traceback.format_exc()
-        return {"error": str(e), "traceback": tb}
+        return jsonify({"error": str(e)}), 500
