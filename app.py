@@ -1,120 +1,125 @@
 # app.py
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pypdf import PdfReader
+from PyPDF2 import PdfReader
 from groq import Groq
 import os
-import json
 import traceback
-from io import BytesIO
 
-app = FastAPI(title="DV SciOly Quiz Backend")
+app = FastAPI(title="Quiz Backend")
 
-# CORS for Wix
+# Allow all origins so Wix can call the backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
+# Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "Quiz backend is live"}
 
-
-# ---------------------------
-# 🔹 1) Upload PDF → Generate Quiz
-# ---------------------------
-@app.post("/generate-quiz")
-async def generate_quiz(pdf: UploadFile = File(...)):
+# ------------------------------
+#       PDF UPLOAD ENDPOINT
+# ------------------------------
+@app.post("/upload")
+async def upload(pdf: UploadFile = File(...)):
     try:
+        # Read file bytes
         pdf_bytes = await pdf.read()
 
-        # Extract text
-        reader = PdfReader(BytesIO(pdf_bytes))
+        # Parse PDF
+        try:
+            reader = PdfReader(pdf_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail="Failed to open PDF. (Encrypted PDFs require PyCryptodome)")
+
         text = ""
         for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
+            extracted = page.extract_text() or ""
+            text += extracted
 
         if not text.strip():
-            return {"error": "Could not extract text from PDF."}
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
 
-        # LLM Prompt
+        # PROMPT
         prompt = f"""
-You are a Science Olympiad quiz generator.
-
-Output STRICTLY in this JSON format:
+You are a quiz generator. Produce 20–40 questions based ONLY on this PDF text.
+Format strictly as JSON:
 
 {{
   "questions": [
     {{
-      "id": number,
+      "id": 1,
       "type": "short" | "mc" | "tf",
       "question": "text",
-      "options": ["a)", "b)", ...] (only for MC),
-      "answer": "correct answer"
-    }}
+      "options": ["a", "b", "c"]  // only for mc
+    }},
+    ...
   ]
 }}
 
-Create 10–20 questions based ONLY on this PDF:
-
+PDF text:
 {text}
 """
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.3,
         )
 
-        raw = response.choices[0].message.content
+        quiz = response.choices[0].message.content
 
-        # Parse JSON from model output
-        try:
-            quiz_json = json.loads(raw)
-        except:
-            quiz_json = json.loads(raw[raw.find("{"): raw.rfind("}")+1])
+        return {"quiz": quiz}
 
-        return quiz_json
+    except HTTPException as e:
+        raise e
 
     except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ---------------------------
-# 🔹 2) Submit Answers → Grade them
-# ---------------------------
+# ------------------------------
+#      GRADING ENDPOINT
+# ------------------------------
 @app.post("/grade")
-async def grade(answers: dict):
+async def grade(payload: dict):
     try:
-        quiz = answers["questions"]
-        user = answers["user_answers"]
+        prompt = f"""
+Grade the student's answers using the quiz below.
+Return ONLY JSON. No backticks.
 
-        scores = {}
-        correct = 0
+Quiz:
+{payload["quiz"]}
 
-        for q in quiz:
-            qid = str(q["id"])
-            correct_ans = q["answer"].strip().lower()
-            user_ans = user.get(qid, "").strip().lower()
+Student Answers:
+{payload["answers"]}
 
-            is_correct = (correct_ans == user_ans)
-            scores[qid] = is_correct
+Format:
+{{
+  "scores": {{
+      "1": true/false,
+      "2": true/false
+  }},
+  "total_correct": X,
+  "total_questions": Y
+}}
+"""
 
-            if is_correct:
-                correct += 1
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
 
-        return {
-            "scores": scores,
-            "total_correct": correct,
-            "total_questions": len(quiz)
-        }
+        result = response.choices[0].message.content
+        return {"graded": result}
 
     except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()}
+        raise HTTPException(status_code=500, detail=str(e))
