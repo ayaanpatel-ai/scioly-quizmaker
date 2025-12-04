@@ -1,13 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from groq import Groq
 import os
+import json
 import traceback
 
-app = FastAPI(title="Quiz Backend")
+app = FastAPI(title="QuizMaker Backend")
 
-# Allow all origins (works with Wix)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,119 +15,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "Quiz backend running"}
+async def root():
+    return {"status": "ok", "message": "Quiz backend is live."}
 
-# ----------------------------
-#   UPLOAD PDF & GENERATE QUIZ
-# ----------------------------
+
+# ---------- QUIZ GENERATION ----------
 @app.post("/upload")
 async def upload(pdf: UploadFile = File(...)):
     try:
-        if not pdf.filename.lower().endswith(".pdf"):
-            raise HTTPException(400, "File must be a PDF")
-
-        # Read raw PDF bytes
+        # Read PDF
         pdf_bytes = await pdf.read()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
 
-        # Load PDF with pypdf
-        try:
-            reader = PdfReader(pdf_bytes)
-        except Exception as e:
-            raise HTTPException(400, f"Failed to open PDF: {str(e)}")
-
-        # Extract text
         text = ""
         for page in reader.pages:
-            try:
-                text += page.extract_text() or ""
-            except:
-                continue
+            extracted = page.extract_text() or ""
+            text += extracted + "\n"
 
         if not text.strip():
-            raise HTTPException(400, "PDF text could not be extracted")
+            return {"error": "Failed to extract text from PDF."}
 
-        # Prompt to generate quiz JSON
         prompt = f"""
-Turn the following text into a JSON quiz. 
-Use this format EXACTLY:
+You are a quiz generator. Based ONLY on the following content:
+
+{text}
+
+Produce EXACT JSON in this structure ONLY:
 
 {{
   "questions": [
     {{
       "id": 1,
-      "type": "short" | "mc" | "tf" | "yn",
-      "question": "...",
-      "options": ["a)", "b)", ...]  // only for MC
+      "type": "short|mc|tf|yn",
+      "question": "text",
+      "options": ["a","b","c","d"] OR [],
+      "answer": "correct answer"
     }}
   ]
 }}
-
-Content to generate quiz from:
-{text}
+Only return JSON. No markdown. No code blocks.
 """
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.3,
         )
 
-        quiz_json = response.choices[0].message.content
+        content = response.choices[0].message.content
 
-        return {"quiz": quiz_json}
+        # Fix: remove ```json or ``` wrappers if they appear
+        if content.startswith("```"):
+            content = content.split("```")[-2]
 
-    except HTTPException as e:
-        raise e
+        data = json.loads(content)
+
+        return data
+
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Server error: {str(e)}")
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 
-# ----------------------------
-#   GRADING ROUTE
-# ----------------------------
+# ---------- QUIZ GRADING ----------
 @app.post("/grade")
-async def grade(data: dict):
+async def grade(payload: dict):
+    """
+    payload structure:
+    {
+      "questions": [...],
+      "answers": { "1": "user answer", ... }
+    }
+    """
     try:
-        questions = data.get("questions")
-        user_answers = data.get("answers")
+        questions = payload["questions"]
+        user_answers = payload["answers"]
 
-        if not questions or not user_answers:
-            raise HTTPException(400, "Missing questions or answers")
+        scores = {}
+        correct_count = 0
 
-        grading_prompt = f"""
-Grade the following quiz answers.
+        for q in questions:
+            qid = str(q["id"])
+            correct = str(q["answer"]).strip().lower()
+            user = str(user_answers.get(qid, "")).strip().lower()
+            is_correct = (user == correct)
 
-Return ONLY valid JSON.
+            scores[qid] = is_correct
+            if is_correct:
+                correct_count += 1
 
-Questions:
-{questions}
-
-User answers:
-{user_answers}
-
-Respond in this strict JSON format:
-
-{{
-  "scores": {{ "1": true/false, ... }},
-  "total_correct": 0,
-  "total_questions": 0
-}}
-"""
-
-        result = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": grading_prompt}],
-        )
-
-        graded = result.choices[0].message.content
-        return {"graded": graded}
+        return {
+            "scores": scores,
+            "total_correct": correct_count,
+            "total_questions": len(questions)
+        }
 
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Grading error: {str(e)}")
+        return {"error": str(e)}
