@@ -10,7 +10,7 @@ from groq import Groq
 
 app = FastAPI(title="SciOly Quiz Backend")
 
-# ----- CORS (Wix compatible) -----
+# Allow Wix
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,20 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----- Groq -----
+# Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# -----------------------------------------------------
+
+# -------------------------------
 # ROOT
-# -----------------------------------------------------
+# -------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "msg": "Quiz backend running"}
+    return {"status": "ok", "message": "Quiz backend running"}
 
 
-# -----------------------------------------------------
-# QUIZ GENERATION (MC ONLY)
-# -----------------------------------------------------
+# -------------------------------
+# GENERATE QUIZ
+# -------------------------------
 @app.post("/upload")
 async def upload(pdf: UploadFile = File(...)):
     try:
@@ -52,68 +53,63 @@ async def upload(pdf: UploadFile = File(...)):
         if not text.strip():
             return {"error": "No extractable text found in PDF"}
 
-        # Force MC-only JSON format
+        # MC ONLY prompt
         prompt = f"""
-        You are a quiz generator. Based ONLY on the following PDF content,
-        generate exactly 10–20 **multiple-choice** questions.
+        Generate ONLY a JSON object in this exact structure:
 
-        **REQUIRED JSON FORMAT (NO markdown, NO backticks):**
         {{
-            "questions": [
-                {{
-                    "id": 1,
-                    "type": "mc",
-                    "question": "text",
-                    "options": ["a) ...", "b) ...", "c) ...", "d) ..."],
-                    "answer": "a"
-                }}
-            ]
+          "questions": [
+            {{
+              "id": 1,
+              "type": "mc",
+              "question": "text",
+              "options": ["a) ...","b) ...","c) ...","d) ..."],
+              "answer": "a"
+            }}
+          ]
         }}
 
         RULES:
-        - ONLY multiple-choice, each with options a/b/c/d.
-        - The correct answer MUST be ONLY a letter ("a", "b", "c", "d").
-        - MUST return valid JSON and nothing else.
-        - All answers must be deterministic and unambiguous.
+        - ALWAYS generate 10 multiple-choice questions.
+        - EVERY question MUST have 4 answer choices.
+        - The correct answer MUST be the letter only: "a", "b", "c", or "d".
+        - NO markdown, NO ```.
 
-        PDF CONTENT:
+        Base ALL questions strictly on this PDF content:
         {text}
         """
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0.3,
         )
 
         content = response.choices[0].message.content.strip()
 
-        # Strip markdown fences if model added them
+        # Remove accidental markdown
         if content.startswith("```"):
-            content = content.split("```")[1]
+            content = content.split("```")[-2]
 
         try:
-            quiz = json.loads(content)
+            quiz_json = json.loads(content)
         except Exception:
-            return {
-                "error": "Model returned invalid JSON.",
-                "raw": content
-            }
+            return {"error": "Model returned invalid JSON", "raw": content}
 
-        return quiz
+        return quiz_json
 
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
-# -----------------------------------------------------
-# GRADING — MC ONLY + RETURNS CORRECT ANSWERS
-# -----------------------------------------------------
+# -------------------------------
+# GRADING (MC ONLY + RETURN CORRECT ANSWER)
+# -------------------------------
 @app.post("/grade")
 async def grade(payload: dict):
     """
-    Expected payload:
+    payload:
     {
       "questions": [...],
       "answers": { "1": "b", ... }
@@ -123,27 +119,25 @@ async def grade(payload: dict):
         questions = payload["questions"]
         user_answers = payload["answers"]
 
-        results = {}
+        scores = {}
+        correct_answers = {}
         correct_count = 0
 
         for q in questions:
             qid = str(q["id"])
-            correct = q.get("answer", "").strip().lower()
+            correct = q["answer"].strip().lower()
             user = user_answers.get(qid, "").strip().lower()
 
-            is_correct = (user == correct)
+            correct_answers[qid] = correct
+            is_correct = (correct == user)
+            scores[qid] = is_correct
 
             if is_correct:
                 correct_count += 1
 
-            results[qid] = {
-                "user_answer": user,
-                "correct_answer": correct,
-                "is_correct": is_correct
-            }
-
         return {
-            "results": results,
+            "scores": scores,
+            "correct_answers": correct_answers,
             "total_correct": correct_count,
             "total_questions": len(questions)
         }
