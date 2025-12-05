@@ -8,9 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from groq import Groq
 
-app = FastAPI(title="SciOly Quiz Backend")
+app = FastAPI(title="Quiz Backend")
 
-# Allow Wix (wide open)
+# Allow Wix
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,29 +18,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq client (make sure GROQ_API_KEY exists)
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-# ---------------------------------------------------
-# ROOT ROUTE
-# ---------------------------------------------------
+# ---------------------------------------
+# ROOT
+# ---------------------------------------
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Quiz backend running"}
 
 
-# ---------------------------------------------------
-# UPLOAD + QUIZ GENERATION
-# ---------------------------------------------------
+# ---------------------------------------
+# QUIZ GENERATOR (MC ONLY)
+# ---------------------------------------
 @app.post("/upload")
 async def upload(pdf: UploadFile = File(...)):
     try:
-        # Read bytes
         pdf_bytes = await pdf.read()
         stream = io.BytesIO(pdf_bytes)
 
-        # Extract text using pypdf
+        # Extract PDF text
         try:
             reader = PdfReader(stream)
             text = ""
@@ -54,38 +52,37 @@ async def upload(pdf: UploadFile = File(...)):
         if not text.strip():
             return {"error": "No extractable text found in PDF"}
 
-        # Prompt that forces valid JSON and forces answers
+        # -----------------------------
+        # FORCE MC-ONLY QUESTIONS
+        # -----------------------------
         prompt = f"""
-        You are a quiz generator. Based ONLY on the following PDF content,
-        generate a JSON object EXACTLY in this format:
+        You are a strict quiz generator. Based ONLY on the PDF text below, generate
+        a JSON object with 10–30 MULTIPLE-CHOICE questions only.
 
+        JSON FORMAT (NO MARKDOWN, NO ```):
         {{
           "questions": [
             {{
               "id": 1,
-              "type": "short" | "mc" | "tf" | "yn",
-              "question": "string",
-              "options": ["a) ...", "b) ...", "c) ..."]  (MC ONLY),
-              "answer": "string (ALWAYS filled in)"
+              "type": "mc",
+              "question": "text",
+              "options": ["a) ...", "b) ...", "c) ...", "d) ..."],
+              "answer": "a"
             }}
           ]
         }}
 
         RULES:
-        - ALWAYS include an "answer" for every question.
-        - MC answers must be only the LETTER: "a", "b", "c", etc.
-        - TF answers must be "true"/"false".
-        - Yes/No answers must be "yes"/"no".
-        - Short answers must be a short phrase, not empty.
-        - Create between 10 and 30 questions.
-        - DO NOT include Markdown, DO NOT include backticks.
-        - Response MUST be pure JSON only.
+        - ALWAYS use multiple choice (mc).
+        - ALWAYS include 4 options: a, b, c, d.
+        - ALWAYS set answer to the correct letter only.
+        - NO markdown, NO commentary, ONLY valid JSON.
+        - Use information STRICTLY found in the PDF.
 
         PDF CONTENT:
         {text}
         """
 
-        # Call Groq
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
@@ -94,114 +91,77 @@ async def upload(pdf: UploadFile = File(...)):
 
         raw = response.choices[0].message.content.strip()
 
-        # Clean accidental ```json or ``` wrappers
+        # remove accidental triple-backticks
         if raw.startswith("```"):
-            try:
-                raw = raw.split("```")[1]
-            except:
-                pass
+            raw = raw.split("```")[1]
+        if raw.endswith("```"):
+            raw = raw.replace("```", "")
 
+        # remove stray markdown labels
         raw = raw.replace("```json", "").replace("```", "").strip()
 
-        # Parse JSON
         try:
-            quiz_json = json.loads(raw)
+            quiz = json.loads(raw)
         except Exception:
             return {
-                "error": "Model returned invalid JSON",
+                "error": "Invalid JSON returned from model.",
                 "raw": raw
             }
 
-        return quiz_json
+        return quiz
 
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
-# ---------------------------------------------------
-# GRADING ENDPOINT (IMPROVED)
-# ---------------------------------------------------
+# ---------------------------------------
+# GRADING ENDPOINT (MC ONLY + RETURN CORRECT ANSWER)
+# ---------------------------------------
 @app.post("/grade")
 async def grade(payload: dict):
     """
-    Expected:
+    payload:
     {
-      "questions": [ ... ],
-      "answers": { "1": "value", "2": "value", ... }
+      "questions": [...],
+      "answers": { "1": "user's answer", ... }
     }
     """
     try:
         questions = payload["questions"]
         user_answers = payload["answers"]
 
-        scores = {}
+        results = {}
         correct_count = 0
-
-        # Normalize answers
-        def normalize(x: str):
-            x = str(x).strip().lower()
-
-            # Normalize common variants
-            if x in ["true", "t", "yes", "y"]:
-                return "true"
-            if x in ["false", "f", "no", "n"]:
-                return "false"
-            return x
 
         for q in questions:
             qid = str(q["id"])
-            qtype = q.get("type", "short")
+            correct = q.get("answer", "").strip().lower()
+            user = user_answers.get(qid, "").strip().lower()
 
-            correct = normalize(q.get("answer", ""))
-            user = normalize(user_answers.get(qid, ""))
+            # Normalize MC like "a)", "A", "a) text"
+            def normalize_mc(x):
+                x = x.lower().strip()
+                x = x.replace(")", "")
+                x = x.split(" ")[0]
+                return x
+            user_norm = normalize_mc(user)
+            correct_norm = normalize_mc(correct)
 
-            # ---- Multiple choice grading ----
-            if qtype == "mc":
-                # User might enter "a", or "a)", or the whole option text
-                user_letter = user.replace(")", "").split(" ")[0]
-                correct_letter = correct.replace(")", "")
-                is_correct = (user_letter == correct_letter)
+            is_correct = (user_norm == correct_norm)
 
-            # ---- True/false or Yes/No ----
-            elif qtype in ["tf", "yn"]:
-                is_correct = (user == correct)
+            results[qid] = {
+                "question": q["question"],
+                "user_answer": user_norm,
+                "correct_answer": correct_norm,
+                "is_correct": is_correct
+            }
 
-            # ---- Short answer ----
-            else:
-                # Require close match – but allow partial scoring using Groq
-                if user == correct:
-                    is_correct = True
-                else:
-                    # Ask Groq to check semantic correctness for short answers
-                    try:
-                        g = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
-                            messages=[
-                                {"role": "user", "content":
-                                    f"""
-                                    Compare the correct answer and user's answer.
-                                    Respond ONLY with "true" or "false".
-
-                                    Correct: {correct}
-                                    User: {user}
-
-                                    Return true if the user answer is semantically correct.
-                                    """}
-                            ],
-                            temperature=0
-                        )
-                        g_res = g.choices[0].message.content.strip().lower()
-                        is_correct = ("true" in g_res)
-                    except:
-                        is_correct = False
-
-            scores[qid] = is_correct
             if is_correct:
                 correct_count += 1
 
         return {
-            "scores": scores,
+            "results": results,
             "total_correct": correct_count,
             "total_questions": len(questions)
         }
