@@ -1,16 +1,15 @@
+# app.py
 import os
 import io
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from groq import Groq
-from difflib import SequenceMatcher
+import traceback
 
-app = FastAPI(title="DV QuizMaker Backend")
+app = FastAPI(title="Quiz Backend")
 
-# -----------------------------
-# CORS (Wix requires *)
-# -----------------------------
+# Allow Wix
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,156 +21,147 @@ app.add_middleware(
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-# -----------------------------------
-# Root health check
-# -----------------------------------
+# -------------------------------
+# ROOT ROUTE
+# -------------------------------
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Quiz backend running"}
 
 
-# -----------------------------------
-# Upload + Generate Quiz
-# -----------------------------------
+# -------------------------------
+# UPLOAD + QUIZ GENERATION
+# -------------------------------
 @app.post("/upload")
 async def upload(pdf: UploadFile = File(...)):
     try:
-        if not pdf.filename.lower().endswith(".pdf"):
-            return {"error": "File must be a PDF"}
+        # Read file into memory as bytes
+        pdf_bytes = await pdf.read()
+        stream = io.BytesIO(pdf_bytes)
 
-        # Ensure large PDFs load properly (up to ~10MB)
-        file_bytes = await pdf.read()
-        pdf_stream = io.BytesIO(file_bytes)
-
+        # Extract text
         try:
-            reader = PdfReader(pdf_stream)
+            reader = PdfReader(stream)
+            text = ""
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
         except Exception as e:
             return {"error": f"Failed to open PDF: {str(e)}"}
 
-        # Extract text
-        text = ""
-        for page in reader.pages:
-            extracted = page.extract_text() or ""
-            text += extracted + "\n\n"
+        if not text.strip():
+            return {"error": "No extractable text found in PDF"}
 
-        if len(text.strip()) < 10:
-            return {"error": "PDF text could not be extracted"}
-
-        # Force the model to ALWAYS include an answer field
+        # Force model to always include answers
         prompt = f"""
-You are generating a JSON quiz from this PDF content.
-RULES:
-- ALWAYS include an "answer" field for every question.
-- Allowed types: "short", "mc", "tf", "yn"
-- For MC, provide "options": ["A) ...", "B) ...", ...]
-- The JSON MUST NOT include markdown.
-- Produce exactly this structure:
+        You are a quiz generator. Based strictly on the following PDF content, generate a JSON object ONLY in this format:
 
-{{
-  "questions": [
-    {{
-      "id": 1,
-      "type": "short",
-      "question": "What is ...?",
-      "answer": "the correct answer"
-    }}
-  ]
-}}
+        {{
+          "questions": [
+            {{
+              "id": 1,
+              "type": "short/mc/tf/yn",
+              "question": "text",
+              "options": ["A", "B", ...]  (only for MC),
+              "answer": "the correct answer ALWAYS filled in"
+            }}
+          ]
+        }}
 
-PDF CONTENT BELOW:
-{text}
-"""
+        RULES:
+        - ALWAYS include an answer.
+        - For MC questions, answers must be only the letter (e.g., "a").
+        - For TF/YN questions, answers must be "true"/"false"/"yes"/"no".
+        - Create 10–30 questions.
+        - JSON only, no markdown, no backticks.
 
+        PDF CONTENT:
+        {text}
+        """
+
+        # Call Groq
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0.3,
         )
 
-        quiz_text = response.choices[0].message.content
+        content = response.choices[0].message.content
 
-        # Parse JSON from model
+        # Clean JSON (remove accidental ```json or stray characters)
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[-2]
+
+        # Try parsing
         import json
-        quiz = json.loads(quiz_text)
+        try:
+            quiz_json = json.loads(content)
+        except Exception:
+            return {
+                "error": "Model returned invalid JSON. Raw output included.",
+                "raw": content
+            }
 
-        return quiz
+        return quiz_json
 
     except Exception as e:
+        traceback.print_exc()
         return {"error": str(e)}
 
 
-# -----------------------------------
-# Grading Helpers
-# -----------------------------------
-
-def normalize(s: str):
-    return s.strip().lower()
-
-def similar(a, b):
-    """fuzzy match ratio"""
-    return SequenceMatcher(None, a, b).ratio()
-
-
-# -----------------------------------
-# Grade Endpoint
-# -----------------------------------
+# -------------------------------
+# GRADING ENDPOINT (IMPROVED)
+# -------------------------------
 @app.post("/grade")
 async def grade(payload: dict):
     """
-    Payload:
+    Expected:
     {
       "questions": [...],
-      "answers": { "1": "user input", ... }
+      "answers": { "1": "user text", ... }
     }
     """
     try:
+        import json
+
         questions = payload["questions"]
         user_answers = payload["answers"]
 
         scores = {}
         correct_count = 0
 
+        def normalize(x):
+            x = str(x).strip().lower()
+            # Normalize T/F / Yes/No
+            if x in ["true", "t", "yes", "y"]:
+                return "true"
+            if x in ["false", "f", "no", "n"]:
+                return "false"
+            return x
+
         for q in questions:
             qid = str(q["id"])
-            correct = normalize(str(q.get("answer", "")))
-            user = normalize(str(user_answers.get(qid, "")))
+            correct = normalize(q.get("answer", ""))
+            user = normalize(user_answers.get(qid, ""))
 
-            # Empty user answer? Always incorrect.
-            if user.strip() == "":
-                scores[qid] = False
-                continue
-
-            is_correct = False
-
-            # ---------- MC QUESTIONS ----------
+            # Multiple choice: allow "a", "a)", "A", "a) option text"
             if q["type"] == "mc":
-                # allow user to input "a" or "A" or "A)"
-                user_letter = user[0]
-                correct_letter = correct[0]
-                if user_letter == correct_letter:
-                    is_correct = True
+                user_letter = user.replace(")", "").split(" ")[0]
+                correct_letter = correct.replace(")", "")
+                is_correct = (user_letter == correct_letter)
 
-            # ---------- TRUE/FALSE / YES/NO ----------
+            # Short answer: require literal match
+            elif q["type"] == "short":
+                is_correct = (user == correct)
+
+            # True/false & yes/no normalized
             elif q["type"] in ["tf", "yn"]:
-                truth_map = {
-                    "true": "true",
-                    "t": "true",
-                    "yes": "true",
-                    "y": "true",
-                    "false": "false",
-                    "f": "false",
-                    "no": "false",
-                    "n": "false",
-                }
-                user_norm = truth_map.get(user, user)
-                correct_norm = truth_map.get(correct, correct)
-                is_correct = (user_norm == correct_norm)
+                is_correct = (user == correct)
 
-            # ---------- SHORT ANSWER ----------
             else:
-                # fuzzy match threshold
-                if similar(user, correct) > 0.75:
-                    is_correct = True
+                is_correct = False
 
             scores[qid] = is_correct
             if is_correct:
@@ -184,4 +174,5 @@ async def grade(payload: dict):
         }
 
     except Exception as e:
+        traceback.print_exc()
         return {"error": str(e)}
