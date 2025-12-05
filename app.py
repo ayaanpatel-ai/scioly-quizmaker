@@ -8,9 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pypdf import PdfReader
 from groq import Groq
 
-app = FastAPI(title="Quiz Backend")
+app = FastAPI(title="SciOly Quiz Backend")
 
-# Allow Wix
+# ----- CORS (Wix compatible) -----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,27 +18,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----- Groq -----
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-
-# ---------------------------------------
+# -----------------------------------------------------
 # ROOT
-# ---------------------------------------
+# -----------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Quiz backend running"}
+    return {"status": "ok", "msg": "Quiz backend running"}
 
 
-# ---------------------------------------
-# QUIZ GENERATOR (MC ONLY)
-# ---------------------------------------
+# -----------------------------------------------------
+# QUIZ GENERATION (MC ONLY)
+# -----------------------------------------------------
 @app.post("/upload")
 async def upload(pdf: UploadFile = File(...)):
     try:
         pdf_bytes = await pdf.read()
         stream = io.BytesIO(pdf_bytes)
 
-        # Extract PDF text
+        # Extract text
         try:
             reader = PdfReader(stream)
             text = ""
@@ -52,32 +52,29 @@ async def upload(pdf: UploadFile = File(...)):
         if not text.strip():
             return {"error": "No extractable text found in PDF"}
 
-        # -----------------------------
-        # FORCE MC-ONLY QUESTIONS
-        # -----------------------------
+        # Force MC-only JSON format
         prompt = f"""
-        You are a strict quiz generator. Based ONLY on the PDF text below, generate
-        a JSON object with 10–30 MULTIPLE-CHOICE questions only.
+        You are a quiz generator. Based ONLY on the following PDF content,
+        generate exactly 10–20 **multiple-choice** questions.
 
-        JSON FORMAT (NO MARKDOWN, NO ```):
+        **REQUIRED JSON FORMAT (NO markdown, NO backticks):**
         {{
-          "questions": [
-            {{
-              "id": 1,
-              "type": "mc",
-              "question": "text",
-              "options": ["a) ...", "b) ...", "c) ...", "d) ..."],
-              "answer": "a"
-            }}
-          ]
+            "questions": [
+                {{
+                    "id": 1,
+                    "type": "mc",
+                    "question": "text",
+                    "options": ["a) ...", "b) ...", "c) ...", "d) ..."],
+                    "answer": "a"
+                }}
+            ]
         }}
 
         RULES:
-        - ALWAYS use multiple choice (mc).
-        - ALWAYS include 4 options: a, b, c, d.
-        - ALWAYS set answer to the correct letter only.
-        - NO markdown, NO commentary, ONLY valid JSON.
-        - Use information STRICTLY found in the PDF.
+        - ONLY multiple-choice, each with options a/b/c/d.
+        - The correct answer MUST be ONLY a letter ("a", "b", "c", "d").
+        - MUST return valid JSON and nothing else.
+        - All answers must be deterministic and unambiguous.
 
         PDF CONTENT:
         {text}
@@ -86,26 +83,21 @@ async def upload(pdf: UploadFile = File(...)):
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2,
         )
 
-        raw = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
 
-        # remove accidental triple-backticks
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-        if raw.endswith("```"):
-            raw = raw.replace("```", "")
-
-        # remove stray markdown labels
-        raw = raw.replace("```json", "").replace("```", "").strip()
+        # Strip markdown fences if model added them
+        if content.startswith("```"):
+            content = content.split("```")[1]
 
         try:
-            quiz = json.loads(raw)
+            quiz = json.loads(content)
         except Exception:
             return {
-                "error": "Invalid JSON returned from model.",
-                "raw": raw
+                "error": "Model returned invalid JSON.",
+                "raw": content
             }
 
         return quiz
@@ -115,16 +107,16 @@ async def upload(pdf: UploadFile = File(...)):
         return {"error": str(e)}
 
 
-# ---------------------------------------
-# GRADING ENDPOINT (MC ONLY + RETURN CORRECT ANSWER)
-# ---------------------------------------
+# -----------------------------------------------------
+# GRADING — MC ONLY + RETURNS CORRECT ANSWERS
+# -----------------------------------------------------
 @app.post("/grade")
 async def grade(payload: dict):
     """
-    payload:
+    Expected payload:
     {
       "questions": [...],
-      "answers": { "1": "user's answer", ... }
+      "answers": { "1": "b", ... }
     }
     """
     try:
@@ -139,26 +131,16 @@ async def grade(payload: dict):
             correct = q.get("answer", "").strip().lower()
             user = user_answers.get(qid, "").strip().lower()
 
-            # Normalize MC like "a)", "A", "a) text"
-            def normalize_mc(x):
-                x = x.lower().strip()
-                x = x.replace(")", "")
-                x = x.split(" ")[0]
-                return x
-            user_norm = normalize_mc(user)
-            correct_norm = normalize_mc(correct)
-
-            is_correct = (user_norm == correct_norm)
-
-            results[qid] = {
-                "question": q["question"],
-                "user_answer": user_norm,
-                "correct_answer": correct_norm,
-                "is_correct": is_correct
-            }
+            is_correct = (user == correct)
 
             if is_correct:
                 correct_count += 1
+
+            results[qid] = {
+                "user_answer": user,
+                "correct_answer": correct,
+                "is_correct": is_correct
+            }
 
         return {
             "results": results,
