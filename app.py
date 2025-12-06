@@ -123,10 +123,28 @@ async def grade(payload: dict):
         correct_answers = {}
         correct_count = 0
 
+        def clean_answer(ans: str) -> str:
+            """
+            Normalize answers like:
+            'a)', 'A', 'a. ', 'a) text', 'a: ', 'A )'
+            into just: 'a'
+            """
+            if not ans:
+                return ""
+            ans = ans.strip().lower()
+
+            # First character must be a, b, c, or d
+            if len(ans) > 0 and ans[0] in ["a", "b", "c", "d"]:
+                return ans[0]
+
+            return ans  # fallback
+
         for q in questions:
             qid = str(q["id"])
-            correct = q["answer"].strip().lower()
-            user = user_answers.get(qid, "").strip().lower()
+
+            # Clean both correct + user answers
+            correct = clean_answer(q["answer"])
+            user = clean_answer(user_answers.get(qid, ""))
 
             correct_answers[qid] = correct
             is_correct = (correct == user)
